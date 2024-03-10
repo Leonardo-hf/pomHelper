@@ -1,12 +1,14 @@
 # pomHelper
 
-### constructors:
+A helper for parsing `.pom`
+
+### Constructors:
 
 * from_coordinate
 * from_string
 * from_url/from_urls
 
-### functions:
+### Functions:
 
 * get_group_id
 * get_artifact
@@ -17,7 +19,9 @@
 * get_properties
 * get_parent
 
-### CASE
+### Cases
+
+More cases in `pom_helper/test`
 
 ```python
 from pom_helper import POM, DEFAULT_HANDLERS

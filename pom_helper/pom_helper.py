@@ -1,18 +1,25 @@
+import logging
 import os.path
 import re
-from typing import List, Union, Optional
+from typing import List, Union, Optional, Callable, Final, Dict
 
 import requests
+from attr import dataclass
 from lxml import etree
 
+# A function which should accept 'group', 'artifact' & 'version' and return the content of the pom
+Handler = Callable[[str, str, str], str]
 
+
+# Default implement of the hanlder
+# which use 'group', 'artifact' & 'version' to search the pom in maven central repository
 def central_handler(group: str, artifact: str, version: str):
     return 'https://repo1.maven.org/maven2/{}/{}/{}/{}-{}.pom'.format(
         group.replace('.', '/'), artifact, version,
         artifact, version)
 
 
-DEFAULT_HANDLERS = [
+DEFAULT_HANDLERS: List[Handler] = [
     central_handler
 ]
 
@@ -32,7 +39,22 @@ TAG_PROFILE_ID = "id"
 
 UNDEFINED = "$undefined"
 
-ERR_INVALID = Exception('[POM] invalid pom/coordinate/urls')
+
+class POMError(Exception):
+    def __init__(self, message):
+        self.message = message
+
+    def __str__(self):
+        return '[POM] {}'.format(self.message)
+
+
+# Fail to find the content of the pom in a right formal by the given coordinate
+ERR_INVALID = POMError('invalid constructor parameter')
+
+
+# Fail to indentify the key attribute in the pom
+def fail_to_identity(e):
+    raise POMError('cannot identify {}'.format(e))
 
 
 def is_undefined(v: Optional[str]):
@@ -47,22 +69,37 @@ def is_valid(v):
     return not is_undefined(v) and not is_none(v)
 
 
+@dataclass(hash=True, eq=True)
+class Package:
+    artifact: str
+    group: str
+    version: str
+
+
+@dataclass(hash=True, eq=True)
+class Dependency(Package):
+    scope: str
+    optional: bool
+
+
 class POM:
 
     def __init__(self):
         self._root = UNDEFINED
-        self._namespace: [str, None] = UNDEFINED
-        self._artifact: [str, None] = UNDEFINED
-        self._group: [str, None] = UNDEFINED
-        self._version: [str, None] = UNDEFINED
-        self._dependencies: [List[Dependency], str, None] = UNDEFINED
-        self._dependencies_management: [List[Dependency], str, None] = UNDEFINED
-        self._properties: [{str: str}, str, None] = UNDEFINED
-        self._profiles: Union[{str: POM}, str, None] = UNDEFINED
+        self._namespace: Union[str, None] = UNDEFINED
+        self._artifact: Union[str, None] = UNDEFINED
+        self._group: Union[str, None] = UNDEFINED
+        self._version: Union[str, None] = UNDEFINED
+        self._dependencies: Union[List[Dependency], str, None] = UNDEFINED
+        self._dependencies_management: Union[List[Dependency], str, None] = UNDEFINED
+        self._properties: Union[Dict[str, str], str, None] = UNDEFINED
+        self._profiles: Union[Dict[str, POM], str, None] = UNDEFINED
         self._parent: Union[POM, str, None] = UNDEFINED
-        self._plain: [str, None] = UNDEFINED
-        self._urls: [List[str], str, None] = UNDEFINED
-        self._url_handlers = UNDEFINED
+        self._plain: Union[str, None] = UNDEFINED
+        self._urls: Union[List[str], str, None] = UNDEFINED
+        self._url_handlers: Union[Handler, str, None] = UNDEFINED
+        self._re_namespace: Final[re.Pattern] = re.compile('({.*?})')
+        self._re_ref: Final[re.Pattern] = re.compile('(\\${.*?})')
 
     def iter(self, node, tag):
         return node.iter(self._namespace + tag)
@@ -96,11 +133,10 @@ class POM:
             self._plain = self._plain[self._plain.find('<'):]
             self._root = etree.fromstring(self._plain.encode('UTF-8'),
                                           parser=etree.XMLParser(remove_comments=True, remove_pis=True, recover=True))
-            self._namespace = ''
-            match = re.search('{.*}', self._root.tag)
-            if match:
-                span = match.span()
-                self._namespace = self._root.tag[span[0]: span[1]]
+            try:
+                self._namespace = self._re_namespace.search(self._root.tag).group(1)
+            except AttributeError:
+                self._namespace = ''
             return self._root
         # build plain from urls, and do again
         if is_valid(self._urls):
@@ -121,7 +157,7 @@ class POM:
         if is_none(v):
             parent = self.get_parent()
             if is_none(parent):
-                raise Exception('[POM] cannot find {}'.format(TAG_PARENT))
+                fail_to_identity(TAG_PARENT)
             v = parent.get_group_id()
         self._group = v
         return v
@@ -133,7 +169,7 @@ class POM:
         # search <artifact>
         v = self.value(root, TAG_ARTIFACT)
         if is_none(v):
-            raise Exception('[POM] cannot find {}'.format(TAG_ARTIFACT))
+            fail_to_identity(TAG_ARTIFACT)
         self._artifact = v
         return v
 
@@ -147,7 +183,7 @@ class POM:
         if is_none(v):
             parent = self.get_parent()
             if is_none(parent):
-                raise Exception('[POM] cannot find {}'.format(TAG_PARENT))
+                fail_to_identity(TAG_PARENT)
             v = parent.get_version()
         # check if version has ${XXX}
         v = self._check_ref(v)
@@ -157,30 +193,38 @@ class POM:
     def get_dependencies(self):
         if not is_undefined(self._dependencies):
             return self._dependencies
+        dependencies = {}
         root = self.get_root()
         # search <dependencies>
         deps = self.search(root, TAG_DEPENDENCIES)
-        if is_none(deps):
-            self._dependencies = None
-            return None
-        self._dependencies = self._extract_dependencies(deps)
+        if not is_none(deps):
+            for d in self._extract_dependencies(deps):
+                dependencies.setdefault((d.group, d.artifact), d)
+        # add parent's dependencies, ignore redundant
+        if not is_none(self.get_parent()):
+            for d in self.get_parent().get_dependencies():
+                dependencies.setdefault((d.group, d.artifact), d)
+        self._dependencies = list(dependencies.values())
         return self._dependencies
 
     def get_dependencies_management(self):
         if not is_undefined(self._dependencies_management):
             return self._dependencies_management
+        dependencies_management = {}
         root = self.get_root()
         # search <dependencyManagement>
         deps_manage = self.search(root, TAG_DEPENDENCIES_MANAGE)
-        if is_none(deps_manage):
-            self._dependencies_management = None
-            return None
-        # search <dependencyManagement.dependencies>
-        deps = self.search(deps_manage, TAG_DEPENDENCIES)
-        if is_none(deps):
-            self._dependencies_management = None
-            return None
-        self._dependencies_management = self._extract_dependencies(deps, is_manage=True)
+        if not is_none(deps_manage):
+            # search <dependencyManagement.dependencies>
+            deps = self.search(deps_manage, TAG_DEPENDENCIES)
+            if not is_none(deps):
+                for d in self._extract_dependencies(deps, is_manage=True):
+                    dependencies_management.setdefault((d.group, d.artifact), d)
+        # add parent's dependencies_management, ignore redundant
+        if not is_none(self.get_parent()):
+            for d in self.get_parent().get_dependencies_management():
+                dependencies_management.setdefault((d.group, d.artifact), d)
+        self._dependencies_management = list(dependencies_management.values())
         return self._dependencies_management
 
     def get_profiles(self):
@@ -211,49 +255,44 @@ class POM:
         # TODO: if field is blank, it may be switched by profile
         if not field:
             return ''
-        refs = re.findall('\\${.*?}', field)
+        # may be ${xxx}-${yyy}
+        refs = self._re_ref.findall(field)
         for r in refs:
             key = v = r[2:-1]
-            parent = self
+            s = self
             # if not found, search in parent's properties
-            while not is_none(parent):
+            while not is_none(s):
                 # if ${project.version}, use project's version
                 if key == 'project.version':
-                    v = parent.get_version()
+                    v = s.get_version()
                     break
                 # if ${project.parent.version}, use project's parent's version
                 if key == 'project.parent.version':
                     # TODO: but if there is no parent,
-                    if is_none(parent.get_parent()):
+                    if is_none(s.get_parent()):
                         v = 'None'
                         break
-                    v = parent.get_parent().get_version()
+                    v = s.get_parent().get_version()
                     break
-                properties = parent.get_properties()
+                properties = s.get_properties()
                 # if <XXX> = ${XXX}, search its parent
                 if not is_none(properties) and key in properties and properties[key] != r:
                     v = properties[key]
                     break
-                parent = parent.get_parent()
+                s = s.get_parent()
             # not found, there must be an error
             if v == key:
-                continue
+                fail_to_identity('ref')
             # it should get, but may still be ${XXX} or ${project.version}, so check again
-            v = parent._check_ref(v)
+            v = self._check_ref(v)
             field = field.replace(r, v)
         return field
 
-    def _extract_dependencies(self, deps, is_manage=False):
+    def _extract_dependencies(self, deps, is_manage=False) -> List[Dependency]:
         dependencies = []
         for dep in self.iter(deps, TAG_DEPENDENCY):
             # get artifact
             artifact = self.value(dep, TAG_ARTIFACT)
-            if is_none(artifact):
-                print('[POM] dependency has no {}, source: {}'.format(
-                    TAG_ARTIFACT,
-                    list(map(lambda h: h(self.get_group_id(), self.get_artifact(), self.get_version()),
-                             self._url_handlers))))
-                continue
             artifact = self._check_ref(artifact)
             # if artifact is `unspecified`, skip
             if artifact == 'unspecified':
@@ -262,49 +301,34 @@ class POM:
             group = self.value(dep, TAG_GROUP)
             if group == '${project.groupId}':
                 group = self.get_group_id()
-            if is_none(group):
-                print('[POM] dependency has no {}, source: {}, target: artifact = {}'.format(
-                    TAG_GROUP,
-                    list(map(lambda h: h(self.get_group_id(), self.get_artifact(), self.get_version()),
-                             self._url_handlers)), artifact))
             group = self._check_ref(group)
             # get version
             version = self.value(dep, TAG_VERSION)
             # get scope & optional
-            scope = self.value_or_default(dep, TAG_SCOPE, default='provided')
-            optional = self.value_or_default(dep, TAG_OPTIONAL, default='false')
+            scope = self.value_or_default(dep, TAG_SCOPE, default='compile')
+            optional = bool(self.value_or_default(dep, TAG_OPTIONAL, default=False))
             # version is ${XXX} search in properties
             if not is_none(version):
                 version = self._check_ref(version)
             # version is none, search in self and parent's management
             if is_none(version) and not is_manage:
-                parent = self
-                while not is_none(parent) and is_none(version):
-                    pdeps = parent.get_dependencies_management()
-                    parent = parent.get_parent()
+                s = self
+                while not is_none(s) and is_none(version):
+                    pdeps = s.get_dependencies_management()
+                    s = s.get_parent()
                     if is_none(pdeps):
                         continue
-                    for d in pdeps:
-                        if group == d.group and artifact == d.artifact:
-                            version = d.version
-                            break
+                    try:
+                        version = next(d for d in pdeps if group == d.group and artifact == d.artifact).version
+                    except StopIteration:
+                        continue
             # while parsing dependencyManagement,
             # scope `import` means importing extra dependencyManagement from target pom
             if is_manage and scope == 'import':
                 target = self.from_coordinate(artifact=artifact, group=group, version=version)
                 deps = target.get_dependencies_management()
                 if not is_none(deps):
-                    for d in deps:
-                        dependencies.append(d)
-            # if version is still undefined, log
-            if is_none(version):
-                print(
-                    '[POM] dependency has no {}, source: {}'
-                    ', target: group = {}, artifact = {}'.format(
-                        TAG_VERSION,
-                        list(map(lambda h: h(self.get_group_id(), self.get_artifact(), self.get_version()),
-                                 self._url_handlers)),
-                        group, artifact))
+                    dependencies.extend(deps)
             dependencies.append(
                 Dependency(group=group, artifact=artifact, version=version, scope=scope, optional=optional))
         return dependencies
@@ -337,7 +361,7 @@ class POM:
         return self._parent
 
     @classmethod
-    def from_coordinate(cls, group, artifact, version, url_handlers=DEFAULT_HANDLERS):
+    def from_coordinate(cls, group: str, artifact: str, version: str, url_handlers: List[Handler] = DEFAULT_HANDLERS):
         pom = cls()
         pom._artifact = artifact
         pom._group = group
@@ -346,51 +370,22 @@ class POM:
         return pom
 
     @classmethod
-    def from_string(cls, plain, url_handlers=DEFAULT_HANDLERS):
+    def from_string(cls, plain: str, url_handlers: List[Handler] = DEFAULT_HANDLERS):
         pom = cls()
         pom._plain = plain
         pom._url_handlers = url_handlers
         return pom
 
     @classmethod
-    def from_url(cls, url, url_handlers=DEFAULT_HANDLERS):
+    def from_url(cls, url: str, url_handlers: List[Handler] = DEFAULT_HANDLERS):
         return cls.from_urls([url], url_handlers=url_handlers)
 
     @classmethod
-    def from_urls(cls, urls, url_handlers=DEFAULT_HANDLERS):
+    def from_urls(cls, urls: List[str], url_handlers: List[Handler] = DEFAULT_HANDLERS):
         pom = cls()
         pom._urls = urls
         pom._url_handlers = url_handlers
         return pom
-
-
-class Package:
-    def __init__(self, group, artifact, version):
-        self.artifact = artifact
-        self.group = group
-        self.version = version
-
-    def __dict__(self):
-        return {
-            'artifact': self.artifact,
-            'group': self.group,
-            'version': self.version
-        }
-
-
-class Dependency(Package):
-    def __init__(self, group, artifact, version, scope, optional):
-        super().__init__(group, artifact, version)
-        self.scope = scope
-        self.optional = optional
-
-    def __dict__(self):
-        d = super().__dict__()
-        d.update({
-            'scope': self.scope,
-            'optional': self.optional
-        })
-        return d
 
 
 def fetch(urls: List[str]) -> Union[str, None]:
@@ -401,10 +396,10 @@ def fetch(urls: List[str]) -> Union[str, None]:
                 with open(url, 'r') as f:
                     return f.read()
             continue
-        print('[POM] downloading {}...'.format(url))
+        logging.info('[POM] downloading {}...'.format(url))
         while True:
             try:
-                res = requests.get(url)
+                res = requests.get(url, proxies={'http': 'http://127.0.0.1:7890', 'https': 'http://127.0.0.1:7890'})
                 if res.status_code == 404:
                     break
                 html = res.text
