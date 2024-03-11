@@ -399,11 +399,11 @@ def fetch(urls: List[str]) -> Union[str, None]:
         logging.info('[POM] downloading {}...'.format(url))
         while True:
             try:
-                res = requests.get(url, proxies={'http': 'http://127.0.0.1:7890', 'https': 'http://127.0.0.1:7890'})
+                res = requests.get(url)
                 if res.status_code == 404:
                     break
                 html = res.text
                 return html
             except Exception as e:
-                print(e)
+                logging.warning(e)
     return None
