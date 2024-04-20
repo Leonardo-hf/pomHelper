@@ -1,6 +1,7 @@
 import logging
 import os.path
 import re
+import time
 from typing import List, Union, Optional, Callable, Final, Dict
 
 import requests
@@ -241,7 +242,7 @@ class POM:
         for profile in self.iter(profiles, TAG_PROFILE):
             pid = self.value(profile, TAG_PROFILE_ID)
             pom = self.from_coordinate(group=self.get_group_id(), artifact=self.get_artifact(),
-                                       version=self.get_version())
+                                       version=self.get_version(), url_handlers=self._url_handlers)
             pom._plain = etree.tostring(profile).decode()
             pom._parent = pom.get_parent()
             if is_none(pom.get_properties()):
@@ -325,7 +326,8 @@ class POM:
             # while parsing dependencyManagement,
             # scope `import` means importing extra dependencyManagement from target pom
             if is_manage and scope == 'import':
-                target = self.from_coordinate(artifact=artifact, group=group, version=version)
+                target = self.from_coordinate(artifact=artifact, group=group, version=version,
+                                              url_handlers=self._url_handlers)
                 deps = target.get_dependencies_management()
                 if not is_none(deps):
                     dependencies.extend(deps)
@@ -357,7 +359,8 @@ class POM:
         artifact = self.value(parent, TAG_ARTIFACT)
         version = self.value(parent, TAG_VERSION)
         version = self._check_ref(version)
-        self._parent = self.from_coordinate(artifact=artifact, group=group, version=version)
+        self._parent = self.from_coordinate(artifact=artifact, group=group, version=version,
+                                            url_handlers=self._url_handlers)
         return self._parent
 
     @classmethod
@@ -396,14 +399,15 @@ def fetch(urls: List[str]) -> Union[str, None]:
                 with open(url, 'r') as f:
                     return f.read()
             continue
-        logging.info('[POM] downloading {}...'.format(url))
+        logging.warning('[POM] downloading {}...'.format(url))
         while True:
             try:
                 res = requests.get(url)
                 if res.status_code == 404:
+                    logging.warning('[POM] download {} fail, file has been deleted from repository.'.format(url))
                     break
                 html = res.text
                 return html
             except Exception as e:
-                logging.warning(e)
+                logging.error(e)
     return None
